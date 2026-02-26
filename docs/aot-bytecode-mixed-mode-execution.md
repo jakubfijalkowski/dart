@@ -26,8 +26,10 @@ as bytecode.
 9. [Stack Frame Interleaving and Unwinding](#9-stack-frame-interleaving-and-unwinding)
 10. [Object Pool and Constant Management](#10-object-pool-and-constant-management)
 11. [Garbage Collection Considerations](#11-garbage-collection-considerations)
-12. [Practical Concerns and Tradeoffs](#12-practical-concerns-and-tradeoffs)
-13. [Summary of Key Source Locations](#13-summary-of-key-source-locations)
+12. [SwitchableCall Resolution Chain in AOT (Deep Dive)](#12-switchablecall-resolution-chain-in-aot-deep-dive)
+13. [Interpreter-Side Instance Call Resolution](#13-interpreter-side-instance-call-resolution)
+14. [Practical Concerns and Tradeoffs](#14-practical-concerns-and-tradeoffs)
+15. [Summary of Key Source Locations](#15-summary-of-key-source-locations)
 
 ---
 
@@ -718,9 +720,153 @@ a safepoint.
 
 ---
 
-## 12. Practical Concerns and Tradeoffs
+## 12. SwitchableCall Resolution Chain in AOT (Deep Dive)
 
-### 12.1 Performance
+This section provides a detailed walk-through of exactly what happens when an
+AOT call site encounters a receiver for which the target is an interpreted
+function. Understanding this chain is critical for the "extern function" model.
+
+### 12.1 AOT call site lifecycle
+
+Every instance call site in AOT code starts life as an `UnlinkedCall`. The call
+site data is a pair `(data, entry_point)` stored inline at the call site:
+
+```
+Initial state:
+  data  = UnlinkedCall { target_name, arguments_descriptor }
+  entry = StubCode::SwitchableCallMiss().MonomorphicEntryPoint()
+```
+
+On the **first call**, the `SwitchableCallMiss` stub fires and enters
+`DRT_SwitchableCallMiss` (`runtime/vm/runtime_entry.cc:3415`). The handler:
+
+1. Walks the stack to find the caller frame and its Code.
+2. Reads the call site data via `CodePatcher::GetSwitchableCallDataAt`.
+3. Creates a `PatchableCallHandler` and calls `ResolveSwitchAndReturn(old_data)`.
+4. `ResolveTargetFunction` extracts the method name and arguments descriptor
+   from the `UnlinkedCall`, then calls `Resolver::ResolveDynamicForReceiverClass`
+   to find the actual target function for the receiver's class.
+5. `HandleMissAOT` dispatches based on the old data's class ID. For
+   `kUnlinkedCallCid` it calls `DoUnlinkedCallAOT`.
+
+### 12.2 `DoUnlinkedCallAOT` and patching
+
+`runtime/vm/runtime_entry.cc:2763-2805`:
+
+`DoUnlinkedCallAOT` creates an ICData and transitions the call site. If the
+target function has been resolved (not null) and its prologue doesn't need an
+arguments descriptor, the call site is patched to monomorphic:
+
+```
+DoUnlinkedCallAOT(unlinked, target_function):
+  1. Create ICData with the receiver CID → target_function mapping.
+  2. If target doesn't need ARGS_DESC_REG:
+     → Patch to monomorphic: data = Smi(receiver_cid), code = target Code
+     → Or MonomorphicSmiableCall if receiver can be Smi.
+  3. If target needs ARGS_DESC_REG:
+     → Patch to ICCallThroughCode (carries the ICData).
+  4. Return ICData via ReturnAOT for the miss stub to continue.
+```
+
+**Key insight for interpreted functions**: When `target_function` has its code
+set to `StubCode::InterpretCall()`, `target_function.CurrentCode()` returns the
+InterpretCall Code object. The call site gets patched to point to the
+InterpretCall Code's entry point. Subsequent calls for the same receiver class
+go directly to InterpretCall without any miss handler overhead.
+
+### 12.3 Progression through dispatch states
+
+Call sites progress through increasingly general dispatch states:
+
+```
+UnlinkedCall → Monomorphic → SingleTargetCache → ICData → MegamorphicCache
+```
+
+- **Monomorphic** (`kSmiCid`): Checks `receiver_cid == expected_cid`, jumps to
+  cached entry point (which may be InterpretCall's entry).
+- **SingleTargetCache**: Checks `lower_cid <= receiver_cid <= upper_cid`, used
+  when a range of CIDs share the same target function.
+- **ICData** (via `ICCallThroughCode`): Array of `(cid, target)` pairs.
+- **MegamorphicCache**: Hash table lookup for large polymorphic sites.
+
+At **every state**, if the target function is interpreted, its entry point is
+the InterpretCall stub, and this is what gets stored/cached. No special handling
+for interpreted functions is needed at any stage.
+
+### 12.4 Implications for dynamically loaded classes
+
+When bytecode loads a new class with a new CID, existing monomorphic/single-
+target call sites for the same selector will miss (CID doesn't match). The miss
+handler will:
+
+1. Resolve the method for the new class (finding the interpreted function).
+2. Widen the call site (monomorphic → single-target or ICData).
+3. Cache the InterpretCall entry for the new CID.
+
+This happens automatically through the existing switchable call mechanism.
+No special code is needed.
+
+---
+
+## 13. Interpreter-Side Instance Call Resolution
+
+### 13.1 The `InterpretedInstanceCallMissHandler`
+
+When the interpreter's lookup cache misses during an `InterfaceCall` or
+`DynamicCall` bytecode, it calls `DRT_InterpretedInstanceCallMissHandler`
+(`runtime/vm/runtime_entry.cc:3456-3486`):
+
+```
+InterpretedInstanceCallMissHandler(receiver, target_name, arg_desc):
+  1. Finalize receiver's class if needed.
+  2. Call Resolver::ResolveDynamicForReceiverClass.
+  3. If not found, fall back to InlineCacheMissHelper (noSuchMethod dispatch).
+  4. Return the resolved Function.
+```
+
+The interpreter then updates its lookup cache with `(receiver_cid, target_name,
+arg_desc) → Function`. On subsequent calls with the same receiver CID, the
+cache hit path directly calls `Interpreter::Invoke()`.
+
+### 13.2 The `Invoke` decision for resolved targets
+
+After resolving, `Interpreter::Invoke()` checks the target:
+
+- **Interpreted target** (`IsInterpreted(function)` is true): Calls
+  `InvokeBytecode` -- stays entirely within the interpreter, using bytecode
+  frame linkage.
+- **Compiled target** (`HasCode(function)` is true): Calls `InvokeCompiled` --
+  exits to native code via the `InvokeDartCodeFromBytecode` stub.
+- **Neither**: Calls `DRT_CompileFunction` to compile or load bytecode, then
+  retries.
+
+This means the interpreter can seamlessly call both AOT functions and other
+interpreted functions.
+
+### 13.3 `ExternalCall` bytecode: interpreter calling native C functions
+
+The `ExternalCall D` bytecode instruction (`runtime/vm/interpreter.cc:2388-2436`)
+handles calls to native/FFI functions from within interpreted code:
+
+```
+ExternalCall D:
+  1. Load trampoline and native_function from constant pool[D] and pool[D+1].
+  2. If null (not yet resolved):
+     → Call DRT_ResolveExternalCall runtime entry.
+     → Reload from pool after resolution.
+  3. Set up NativeArguments.
+  4. Call InvokeNative(thread, interpreter, trampoline, native_function, args).
+  5. Handle result/exception.
+```
+
+This is the interpreter's equivalent of FFI calls in compiled code. The
+trampoline handles the calling convention translation.
+
+---
+
+## 14. Practical Concerns and Tradeoffs
+
+### 14.1 Performance
 
 Interpreted code is significantly slower than AOT-compiled code (roughly 10-50x
 for computation-heavy code). The transition cost between modes is moderate:
@@ -734,7 +880,7 @@ For hot paths, the interpreter's lookup cache (1024 entries) helps with virtual
 call resolution, but it is far less effective than AOT's dispatch table or
 inline caches.
 
-### 12.2 Memory overhead
+### 14.2 Memory overhead
 
 The interpreter adds:
 - Per-thread interpreter stack (configurable size).
@@ -744,7 +890,7 @@ The interpreter adds:
 Bytecode is typically more compact than native code (~20-50% of native code
 size), which may offset the interpreter overhead for large programs.
 
-### 12.3 Debugging and profiling
+### 14.3 Debugging and profiling
 
 The interpreter supports:
 - **Single-stepping**: Via a single-step flag check in every dispatch.
@@ -755,13 +901,13 @@ The interpreter supports:
 - **Stack traces**: The stack walker correctly produces combined traces spanning
   both compiled and interpreted frames.
 
-### 12.4 Async/await support
+### 14.4 Async/await support
 
 The interpreter supports `Suspend` and `EntrySuspendable` bytecodes. Interpreted
 async functions create `SuspendState` objects just like compiled ones. The
 `Interpreter::Resume()` method handles resumption after awaited futures complete.
 
-### 12.5 Limitations
+### 14.5 Limitations
 
 - **No tier-up**: There is currently no mechanism to JIT-compile a hot
   interpreted function into native code within an AOT runtime. The interpreter
@@ -777,7 +923,7 @@ async functions create `SuspendState` objects just like compiled ones. The
 
 ---
 
-## 13. Summary of Key Source Locations
+## 15. Summary of Key Source Locations
 
 ### Core bridging mechanism
 
@@ -830,6 +976,20 @@ async functions create `SuspendState` objects just like compiled ones. The
 | Emission (x64) | `runtime/vm/compiler/backend/flow_graph_compiler_x64.cc` | 603-618 |
 | Serialization | `runtime/vm/app_snapshot.cc` | 8904-9474 |
 | Thread::dispatch_table_array_ | `runtime/vm/thread.h` | 853-914 |
+
+### SwitchableCall resolution (AOT)
+
+| Component | File | Line(s) |
+|---|---|---|
+| DRT_SwitchableCallMiss entry | `runtime/vm/runtime_entry.cc` | 3415-3448 |
+| PatchableCallHandler::ResolveSwitchAndReturn | `runtime/vm/runtime_entry.cc` | 3260-3294 |
+| PatchableCallHandler::ResolveTargetFunction | `runtime/vm/runtime_entry.cc` | 3194-3258 |
+| PatchableCallHandler::HandleMissAOT | `runtime/vm/runtime_entry.cc` | 3298-3330 |
+| PatchableCallHandler::DoUnlinkedCallAOT | `runtime/vm/runtime_entry.cc` | 2763-2805 |
+| SwitchableCallMiss stub (x64) | `runtime/vm/compiler/stub_code_compiler_x64.cc` | 3830-3850 |
+| SingleTargetCall stub (x64) | `runtime/vm/compiler/stub_code_compiler_x64.cc` | 3857-3895 |
+| DRT_InterpretedInstanceCallMissHandler | `runtime/vm/runtime_entry.cc` | 3456-3486 |
+| ExternalCall bytecode handler | `runtime/vm/interpreter.cc` | 2388-2436 |
 
 ### Build configuration
 
